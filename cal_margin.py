@@ -253,7 +253,7 @@ def cal_scorecard(df,y_type = 'y5',method = 'pearson'):
 
 def cal_multiPNL(yestData):
     top_pnl = cal_topPNL(yestData,enterRatio=0.95,exitRatio=0.85,year='all',costbps=10,savefigFile=None)
-    top_pnl2 = cal_topPNL2(yestData,ud_field='ud_limit_h2',enterRatio=0.95,exitRatio=0.85,year='all',costbps=10,savefigFile=None)  #
+    top_pnl2 = cal_topPNL2(yestData,ud_field='ud_limit_h2',enterRatio=0.8,exitRatio=0.8,year='all',costbps=10,savefigFile=None)  #
     pos_pnl = cal_posPNL(yestData,y_type='y5')
     ic_test = yestData[['date','y5','yest']].set_index('date')
     res_indicator = cal_scorecard(ic_test,y_type = 'y5',method = 'pearson')
@@ -280,7 +280,69 @@ def cal_margin(m_old,m_new):
 
 
 #%%
-all_files = [pd.read_csv(f'/home/laiminzhi/reconfiguration_code/predict_data/y1_label__all_minmax_no_ud_limit_h2/selected_feature(all)_loss(advance)_depth4_sizes(249_128_128_1)_bd/{f}', dtype={'date':str})for f in sorted(os.listdir('/home/laiminzhi/reconfiguration_code/predict_data/y1_label__all_minmax_no_ud_limit_h2/selected_feature(all)_loss(advance)_depth4_sizes(249_128_128_1)_bd'))]
+all_files = [pd.read_csv(f'/home/laiminzhi/reconfiguration_code/predict_data/y3_label_rank_all_normal_no_ud_limit_h2/selected_feature(all)_loss(combine)_depth4_sizes(249_128_128_1)_bd_valid/{f}',
+                         dtype={'date':str})for f in sorted(os.listdir('/home/laiminzhi/reconfiguration_code/predict_data/y3_label_rank_all_normal_no_ud_limit_h2/selected_feature(all)_loss(combine)_depth4_sizes(249_128_128_1)_bd_valid'))]
+#%%
+#获取截面return的quantile，截取特定的quantile的股票
+def get_specific_quantile(df,quantile_num,quantile):
+    quantile_labels = range(1, quantile_num+1)
+    df['quantile'] = pd.qcut(df['Y_hat'], quantile_num, labels=quantile_labels)
+    subset = df[df['quantile'] == quantile]
+    return subset
+
+all_df = pd.DataFrame()
+for file in all_files:
+    df = get_specific_quantile(file,5,1)
+    all_df = pd.concat([all_df,df],axis=0)
+
+xy = pd.read_hdf('/home/laiminzhi/wenbin/DL_stock_combo/data/xy_data/xy_data.h5').reset_index()
+universe = 'univ_tradable'
+
+xy = xy.loc[xy[universe]==1,:'ud_limit_h4']
+xy = xy.rename(columns={'y1':'y'})
+xy = pd.merge(xy, all_df,on=['date','code'],how='inner')
+
+##---- 0. benchmark ----##
+xy['yest'] = xy['Y_hat']
+#m_pool = cal_multiPNL(xy)
+#%%
+#查看pnl如何计算
+d1 = xy.copy()
+enterRatio = 0.8
+exitRatio = 0.8
+## 1) calculate yestRank;
+d1['yestRank'] = d1.groupby('date')['yest'].rank(method='average',na_option='keep',ascending=True,pct=True)
+rtnMat = pd.pivot_table(data=d1,index='date',columns='code',values='y',dropna=False)
+yestMat = pd.pivot_table(data=d1,index='date',columns='code',values='yest',dropna=False)
+yestRankMat = pd.pivot_table(data=d1,index='date',columns='code',values='yestRank',dropna=False).fillna(0)
+posiMat = pd.DataFrame(np.full(yestRankMat.shape,fill_value=0),index=yestRankMat.index,columns=yestRankMat.columns)
+ud_limitMat = pd.pivot_table(data=d1,index='date',columns='code',values='ud_limit_h2',dropna=False).fillna(0)
+
+## 2) calPosiMat： ## no buy if up_limit && no sell if down_limit;
+for i,row_index in enumerate(posiMat.index):
+    if (i==0):
+        continue
+    flag1 = (yestRankMat.iloc[i,:]>enterRatio)
+    flag2 = (posiMat.iloc[i-1,:]==0) & (ud_limitMat.iloc[i,:]==1)
+    posiMat.loc[row_index,(~flag2 & flag1)] = 1
+
+    flag3 = (yestRankMat.iloc[i,:]>exitRatio) & (yestRankMat.iloc[i,:]<=enterRatio)
+    flag4 = (posiMat.iloc[i-1,:]==1)
+    posiMat.loc[row_index,(flag3 & flag4)] = 1
+
+    flag5 = (posiMat.iloc[i-1,:]==1) & (posiMat.iloc[i,:]==0) & (ud_limitMat.iloc[i,:]==-1)
+    posiMat.loc[row_index,flag5] = 1
+    
+    if (i== (posiMat.shape[0]-1)):## position=0 if yest=NA on last day;
+        flag6 = yestMat.iloc[i,:].isna()
+        posiMat.loc[row_index,flag6] = 0
+
+
+pnlMat = rtnMat * posiMat
+pnlVec = pnlMat.sum(axis=1)/(posiMat==1).sum(axis=1)
+alpha = pnlVec.mean()*1e4
+print(alpha)
+#%%
 yest = pd.concat(all_files, axis=0)
 xy = pd.read_hdf('/home/laiminzhi/wenbin/DL_stock_combo/data/xy_data/xy_data.h5').reset_index()
 universe = 'univ_tradable'

@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.preprocessing import QuantileTransformer
+from sklearn.preprocessing import RobustScaler
 import torch.nn as nn
 np.random.seed(42)
 import torch
@@ -56,7 +57,7 @@ class Config:
     valid_data_rate = 0.15
 
     #规定选用的特征集合。all,am,pm分别表示全天，早盘，晚盘
-    selected_feature = "am"
+    selected_feature = "all"
 
     debug_mode = False #True为debug模式，采用随机抽取的100支股票集合
     
@@ -65,7 +66,7 @@ class Config:
     test_start_date = '20220104'
     
     #规定训练标签,股票池
-    label = 'y1_label'
+    label = 'y3_label'
     universe = 'univ_tradable'
     limit = 'ud_limit_h2' #去掉的涨跌停数据
 
@@ -83,26 +84,26 @@ class Config:
     init_fns = [] #配合激活函数使用相应的参数初始化方法，共有：nn.init.xavier_normal_，nn.init.kaiming_normal_
     #若没有指定，pytorch默认使用Lecun Initialization
     label_normalization = '' #取值有profile,rank和空值
-    feature_nomalization = 'minmax'
+    feature_nomalization = 'normal'
 
     #训练参数
     learning_rate = 0.001
-    epoch = 150 #不考虑早停的前提下整个模型训练多少遍
+    epoch = 25 #不考虑早停的前提下整个模型训练多少遍
     patience = 15
     batch_size = 1
 
     #训练方式（是否增量训练）
     add_train = False
-    do_train = False
-    do_validation = False
-    do_predict = False
+    do_train = True
+    do_validation = True
+    do_predict = True
     shuffle_train_data = False
     use_cuda = True
 
     #模型框架
     str_list = [str(i) for i in layer_sizes]
     size="_".join(str_list)
-    loss = "advance"
+    loss = "wmse_decay"
     subframe = f"{label}_{label_normalization}_{selected_feature}_{feature_nomalization}_no_{limit}"
     if not use_dropout and not use_batch_norm:
         frame = f"selected_feature({selected_feature})_loss({loss})_depth{len(layer_sizes)}_sizes({size})"
@@ -121,7 +122,7 @@ class Config:
     processed_train_data_path = f"/home/laiminzhi/reconfiguration_code/train_data/"+ subframe +"/"
     processed_test_data_path = f"/home/laiminzhi/reconfiguration_code/test_data/"+ subframe+"/"
     
-    save_processed_train_data = True #如果已经有处理好的train_data,这项为false，若为True则会从头处理train data，保存到processed_train_data_path中
+    save_processed_train_data = False #如果已经有处理好的train_data,这项为false，若为True则会从头处理train data，保存到processed_train_data_path中
 
     if not os.path.exists(model_save_path):
         os.makedirs(model_save_path)    # makedirs 递归创建目录
@@ -175,20 +176,32 @@ class Data:
         elif config.label_normalization == "rank" :
             self.label = rank_cross_profile(self.label)
         
-        self.label = self.label[self.config.label].astype(float)       
+        self.label = self.label[self.config.label].astype(float)  
+
+        self.limits = {}     
 
     def read_data(self):
         init_data = pd.read_hdf(self.config.train_data_path)
         return init_data,init_data.columns.tolist()
     
-    def remove_outliers(self,df,columns):
+    def fit_remove_outliers(self,df,columns):
+        #用来在训练集上去除极端值，记录上下界
         for col in columns:
             Q1 = df[col].quantile(0.25)
             Q3 = df[col].quantile(0.75)
             IQR = Q3 - Q1
             lower_limit = Q1 - 1.5 * IQR
             upper_limit = Q3 + 1.5 * IQR
-            df[col] = df[col].clip(lower_limit, upper_limit)
+            df.loc[:,col] = df[col].clip(lower_limit, upper_limit)
+
+            #存储每列的限制
+            self.limits[col] = {'lower_limit': lower_limit, 'upper_limit': upper_limit}
+        return df
+    
+    def transform_remove_outliers(self,df,columns):
+        #在测试集和验证集上应用
+        for col in columns:
+            df.loc[:,col] = df[col].clip(self.limits[col]['lower_limit'], self.limits[col]['upper_limit'])
         return df
     
     def get_train_and_valid_data(self):
@@ -216,6 +229,10 @@ class Data:
         elif config.feature_nomalization == 'normal':
             self.scaler = QuantileTransformer(output_distribution='normal')
         elif config.feature_nomalization == 'minmax':
+            self.scaler = MinMaxScaler()
+        elif config.feature_nomalization == 'robust':
+            train_x_df = self.fit_remove_outliers(train_x_df,train_x_df.columns)
+            valid_x_df = self.transform_remove_outliers(valid_x_df,valid_x_df.columns)
             self.scaler = MinMaxScaler()
 
         train_x_scaled = self.scaler.fit_transform(train_x_df[train_x_df.columns])

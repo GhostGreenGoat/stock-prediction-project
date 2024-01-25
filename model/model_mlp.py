@@ -83,28 +83,31 @@ class MLP(nn.Module):
         return x
     
 class CombinedLoss(nn.Module):
-    def __init__(self,alpha=0.5):
+    def __init__(self, alpha=0.00001*1e-7, lambda_const=100):
         super(CombinedLoss, self).__init__()
-        self.mse_loss = nn.MSELoss()
         self.alpha = alpha
+        self.lambda_const = lambda_const
+        self.mse_loss = nn.MSELoss()
+
     def forward(self, preds, targets):
-        # 计算MSE损失
-        mse = self.mse_loss(preds, targets)
+        # 计算预测值与真实值之间的均方误差
+        mse_loss = self.mse_loss(preds, targets)
+        
+        # 使用广播计算所有排名差异的组合
+        rank_differences = preds[:, None] - preds[None, :]
+        target_rank_differences = targets[:, None] - targets[None, :]
+        
+        # 计算预测排名一致性的惩罚项
+        rank_loss = torch.maximum(
+            torch.tensor(0.0, device=preds.device), 
+            -rank_differences * target_rank_differences + self.lambda_const #容忍相差100名以内
+        ) ** 2
+        # 将两部分损失结合起来
+        total_loss = mse_loss + self.alpha * (rank_loss.mean() - self.lambda_const ** 2)
+        #total_loss = self.alpha * (rank_loss.mean() - self.lambda_const ** 2)
+        #print(f"mse_loss:{mse_loss},rank_loss:{self.alpha * (rank_loss.mean() - self.lambda_const ** 2)},total_loss:{total_loss}")
+        return total_loss
 
-        # 计算斯皮尔曼相关性近似损失
-        preds_rank = preds.argsort().argsort()
-        targets_rank = targets.argsort().argsort()
-        ranks = torch.vstack((preds_rank, targets_rank)).float()  # 转换为浮点数以进行相关性计算
-
-        # 计算相关系数矩阵
-        corr_matrix = torch.corrcoef(ranks)
-
-        # 提取 preds 和 targets 之间的相关系数
-        corr_loss = 1 - corr_matrix[0, 1]
-
-        # 结合两个损失
-        combined_loss = self.alpha * mse + (1 - self.alpha) * corr_loss
-        return combined_loss
 
 class ICLoss(nn.Module):
     def __init__(self,diversity_factor=0.00001):
@@ -160,6 +163,86 @@ class AdvancedCombineLoss(nn.Module):
         total_loss = mse_loss + self.alpha * (rank_loss.mean() - self.lambda_const ** 2)
         #print(f"mse_loss:{mse_loss},rank_loss:{self.alpha * (rank_loss.mean() - self.lambda_const ** 2)},total_loss:{total_loss}")
         return total_loss
+    
+#自定义对数均方误差损失函数
+class LogCoshLoss(nn.Module):
+    def __init__(self):
+        super(LogCoshLoss, self).__init__()
+
+    def forward(self, input, target):
+        epsilon = 1e-6
+        #print(f"input:{input},target:{target}")
+        input = (input+abs(input.min()))
+        log_pred = torch.log(input + 1 + epsilon)
+        #print(f"log_pred:{log_pred}")
+        target = (target+abs(target.min()))
+        log_true = torch.log(target + 1 + epsilon)
+        loss = torch.sqrt(torch.mean(torch.pow(log_pred - log_true, 2)))
+        return loss
+    
+class WeightedClassLoss_decay(nn.Module):   
+    def __init__(self,num_classes=5,highest_weight=1.0,decay_factor=0.5):
+        super(WeightedClassLoss_decay, self).__init__()
+        self.num_classes = num_classes
+        # 设置最高收益率等级的权重为1
+        self.class_weights = {num_classes: highest_weight}
+        
+        # 为其他收益率等级设置半衰加权权重
+        for i in range(num_classes - 1, 0, -1):
+            self.class_weights[i] = self.class_weights[i + 1] * decay_factor 
+        self.device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+
+    def forward(self, predictions, targets):
+        # 获取每个targets对应的权重
+        quantile_targets = self.get_quantiles(targets, self.num_classes)
+        weights = torch.tensor([self.class_weights[q.item()] for q in quantile_targets],device=self.device)
+        # 计算加权的均方误差
+        loss = torch.mean(weights * (predictions - targets) ** 2)
+        return loss
+    
+    def get_quantiles(self,tensor, num_quantiles):
+        # 计算分位数值
+        quantiles = torch.quantile(tensor, torch.linspace(0, 1, steps=num_quantiles+1,device=self.device))
+        # 生成分位数标签，从1到num_quantiles
+        quantile_labels = torch.searchsorted(quantiles, tensor, right=False)
+        #如果quantile_labels为0，则将其设置为1
+        quantile_labels[quantile_labels == 0] = 1
+        return quantile_labels
+      
+class WeightedClassLoss(nn.Module):
+    def __init__(self, num_classes=5, highest_weight=1.0, decay_factor=0.5):
+        super(WeightedClassLoss, self).__init__()
+        self.num_classes = num_classes
+        self.device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+        
+        # 两头高，中间低的权重分配
+        # 创建一个倒三角形分布权重，两边高，中间低
+        weights = np.linspace(start=highest_weight, stop=0, num=(num_classes+1)//2, endpoint=False)
+        if num_classes % 2 == 0:  # 如果类别数是偶数，确保中间两个类别的权重相同
+            weights = np.concatenate((weights, weights[::-1]))
+        else:  # 如果类别数是奇数，中间类别权重为0
+            weights = np.concatenate((weights, [0], weights[::-1]))
+        
+        # 将权重转换为字典形式并存储
+        self.class_weights = {i+1: weight for i, weight in enumerate(weights)}
+        
+    
+    def forward(self, predictions, targets):
+        # 获取每个targets对应的权重
+        quantile_targets = self.get_quantiles(targets, self.num_classes)
+        weights = torch.tensor([self.class_weights[q.item()] for q in quantile_targets],device=self.device)
+        # 计算加权的均方误差
+        loss = torch.mean(weights * (predictions - targets) ** 2)
+        return loss
+    
+    def get_quantiles(self,tensor, num_quantiles):
+        # 计算分位数值
+        quantiles = torch.quantile(tensor, torch.linspace(0, 1, steps=num_quantiles+1,device=self.device))
+        # 生成分位数标签，从1到num_quantiles
+        quantile_labels = torch.searchsorted(quantiles, tensor, right=False)
+        #如果quantile_labels为0，则将其设置为1
+        quantile_labels[quantile_labels == 0] = 1
+        return quantile_labels
 
 def ic(Y_hat,Y):
     Y_hat =Y_hat.cpu()
@@ -217,7 +300,7 @@ def train(config, train_and_valid_data):
         model.load_state_dict(torch.load(config.model_save_path + config.model_name))
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
-    criterion = AdvancedCombineLoss()
+    criterion = WeightedClassLoss_decay()
 
     valid_loss_min = float("inf")
     valid_ic_min = float("-inf")
@@ -285,12 +368,19 @@ def train(config, train_and_valid_data):
         print(f"epoch:{epoch}")
         print(f"the train loss is {train_loss_cur}.the train ic is {train_ic_cur,train_rank_ic_cur}")
         print(f"the valid loss is {valid_loss_cur}.the valid ic is {valid_ic_cur,valid_rank_ic_cur}")
-
-        if valid_rank_ic_cur > valid_ic_min:
-            valid_ic_min = valid_rank_ic_cur
+        
+        if train_rank_ic_cur>0.02 and valid_rank_ic_cur>0.02:
+            if valid_rank_ic_cur > valid_ic_min:
+                valid_ic_min = valid_rank_ic_cur
+                torch.save(model.state_dict(), config.model_save_path + config.model_name)
+                print("model saved!")
+        
+        if valid_loss_cur < valid_loss_min:
+            valid_loss_min = valid_loss_cur
             bad_epoch = 0
             early_stop_epoch = epoch
-            torch.save(model.state_dict(), config.model_save_path + config.model_name)  # 模型保存
+            torch.save(model.state_dict(), config.model_save_path + config.model_name)
+            print("model saved!")
         else:
             bad_epoch += 1
             print(bad_epoch)

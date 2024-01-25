@@ -30,7 +30,7 @@ class CustomDataset(Dataset):
         sample_indices = self.section_data_indices[date] # 该日所有股票在self.index中的索引
         sample_index = self.index[sample_indices] #该日所有股票在原始df中的索引 形状为（section_size,timestep,2）
         if sample_index.shape[0] != 0:
-            last_date = sample_index[0,1,0] #该日最后一个时间步的日期
+            last_date = sample_index[:,-1,:] #该日最后一个时间步的index
         else:
             last_date = 0
         # 将索引转换为元组列表
@@ -45,7 +45,7 @@ class CustomDataset(Dataset):
             sample_Y = sample_Y.values.reshape(sample_index.shape[0], sample_index.shape[1], 1)
             return (sample_X,sample_Y)
         else:
-            return sample_X,last_date
+            return sample_X
     
     def get_section_data(self,data):
         dates = self.index[:,:,0]
@@ -284,7 +284,7 @@ def train(config, train_and_valid_data,train_and_valid_data_index):
 
     draw_fig(config,train_loss_total,valid_loss_total,early_stop_epoch)
 
-def predict(config, test_X, test_Y, test_index):
+def predict(config, test_X, test_index):
     # 获取测试数据
     test_custom_dataset = CustomDataset(test_X, Y=None, index=test_index)
     # 使用 DataLoader 来加载数据集
@@ -299,8 +299,8 @@ def predict(config, test_X, test_Y, test_index):
     # 预测过程
     model.eval()
     hidden_predict = None
-    result = dict()
-    for _test_X,date in test_loader:
+    result = []
+    for _test_X in test_loader:
         _test_X = _test_X.to(device)
         _test_X = _test_X.squeeze(dim=0)
 
@@ -310,6 +310,7 @@ def predict(config, test_X, test_Y, test_index):
             #print(_test_X.shape)
             pred_X, hidden_predict = model(_test_X.float(), hidden_predict)
             hidden_predict = None
-        result[date[0]] = pred_X.detach().cpu().numpy()
+        
+        result.append(pred_X.cpu().numpy())
 
     return result # 先去梯度信息，如果在gpu要转到cpu，最后要返回numpy数据

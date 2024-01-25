@@ -290,44 +290,35 @@ def calculate_spearman(group):
     return spearmanr(group['Y_hat'], group['Y'])[0]
 
 
-def map_dict_to_df(dict_data,df):
+def get_result_index(data_index):
+    """
+    input: data_index是一个三维数组，形状为(样本数，timestep,2),最后一维分别是date和code
+    function:根据data_index，仿照custom_dataloader中的方法，得到每个截面最后一天的数据标签
+    output:(n,batchsize,2)
+    """
+    dates = data_index[:,:,0]
+    data_list = list(np.unique(dates))
+
+    # 获取所有唯一的日期
+    unique_dates = np.unique(dates)
+
+    # 为每个日期创建一个字典来保存数据
+    date_groups ={date: [] for date in unique_dates}
+
+    # 对每个日期进行分组
+    for i, date in enumerate(dates[:,0]):  # 假设每个时间步的日期都相同
+        date_groups[date].append(i)
     
-    # 1. 从原始DataFrame提取股票代码和日期
-    # 通过对df的索引做排序，确保股票代码的顺序和array中的顺序一致
-    print(df.head())
-    df_sorted = df.sort_index()
+    result_index = []
+    for date in data_list:
+        sample_indices = date_groups[date] # 该日所有股票在self.index中的索引
+        sample_index = data_index[sample_indices] #该日所有股票在原始df中的索引 形状为（section_size,timestep,2）
+        if sample_index.shape[0] != 0:
+            last_date = sample_index[:,-1,:] #该日最后一个时间步的index
+            result_index.append(last_date)
+    return result_index
 
-    # 2. 将字典中的值转换为Pandas Series，并设置MultiIndex
-    data_for_series = []
-    index_for_series = []
-
-    for date, array in dict_data.items():
-        # 获取当天的股票代码
-        stocks_for_date = df_sorted.loc[date].index.get_level_values('code')
-        print(date)
-        print(array.shape)
-        print(len(stocks_for_date),len(array))
-        
-        # 确保array的长度和当天的股票数量匹配
-        assert len(array) == len(stocks_for_date), "Array length doesn't match the number of stocks for date " + str(date)
-        
-        # 将array中的值和对应的(index1, index2)添加到列表中
-        for stock, value in zip(stocks_for_date, array):
-            data_for_series.append(value)
-            index_for_series.append((date, stock))
-
-    # 创建一个MultiIndex
-    multi_index = pd.MultiIndex.from_tuples(index_for_series, names=['date', 'code'])
-
-    # 创建Series
-    values_series = pd.Series(data_for_series, index=multi_index)
-
-    # 3. 将新的Series合并到原始DataFrame中
-    df_final = df_sorted.join(values_series.rename('new_column'), how='left')
-
-    return df_final
-
-def save_test_data(Y_hat,test_Y,output_dir):
+def save_test_data(Y_hat,test_Y,Y_index,output_dir):
     """
     input:
         Y_hat为predict函数的输出结果，即模型预测结果，是一个dictionary，key为date，value为numpy数组，形状为(当日的股票个数，1)
@@ -342,11 +333,28 @@ def save_test_data(Y_hat,test_Y,output_dir):
     else:
         df = test_Y
         df.columns=['Y']
-    #把Y_hat字典中的数据填入df
-    
-    df_final = map_dict_to_df(Y_hat,df)
-    print(df_final.head())
-    grouped_df = df.groupby(level='date')
+    #得到Y_hat的索引
+    Y_hat_index = get_result_index(Y_index)
+    #print(len(Y_hat),Y_hat[0].shape) #135 (3139, 1)
+    #print(len(Y_hat_index),Y_hat_index[0].shape) #135 (3139, 2)
+    #把Y_hat恢复为dataframe
+
+    data_frames = []
+    for i in range(len(Y_hat)):
+        data = np.concatenate([Y_hat_index[i], Y_hat[i]], axis=1)  # 合并 date, code 和相应的值
+        df_temp = pd.DataFrame(data, columns=['date', 'code', 'Y_hat'])
+        data_frames.append(df_temp)
+
+    # 合并所有单日的DataFrame
+    df_combined = pd.concat(data_frames, ignore_index=True)
+
+    # 设置 date 和 code 为多重索引
+    df_combined.set_index(['date', 'code'], inplace=True)   
+
+    # 将新数据合并到原始DataFrame中
+    df_final = df_combined.join(df, how='left', rsuffix='_new')
+
+    grouped_df = df_final.groupby(level='date')
     
     for name,group in grouped_df:
         group = group.reset_index(drop=False)
@@ -357,7 +365,7 @@ def save_test_data(Y_hat,test_Y,output_dir):
     daily_correlation = grouped_df.apply(lambda x:x['Y_hat'].corr(x['Y']))
     average_coor = daily_correlation.mean()
     #计算rank ic
-    spearman_correlations = df.groupby(level='date').apply(calculate_spearman)
+    spearman_correlations = df_final.groupby(level='date').apply(calculate_spearman)
     rank_avg = spearman_correlations.mean()
     return (average_coor,rank_avg)
 
@@ -468,15 +476,15 @@ if config.do_train:
 if config.do_validation:
     train_x,valid_x,train_y,valid_y = train_and_valid_data
     print(f"Use validation data to predict...")
-    y_hat = predict(config,valid_x,valid_y,train_and_valid_index[1])
+    y_hat= predict(config,valid_x,train_and_valid_index[1])
     
-    ic = save_test_data(y_hat,valid_y,config.valid_save_path)
+    ic = save_test_data(y_hat,valid_y,train_and_valid_index[1],config.valid_save_path)
     print(f"ic={ic}")
 
 if config.do_predict:
     print(f"Testing...")
     Y_hat_test = predict(config,test_x,test_index)
-    Y_hat = predict(config,train_and_valid_data[0])
+    #Y_hat = predict(config,train_and_valid_data[0]) #用训练集来预测
     
-    ic = save_test_data(Y_hat_test,test_y,config.predict_save_path)
+    ic = save_test_data(Y_hat_test,test_y,test_index,config.predict_save_path)
     print(f"ic={ic[0]},rank ic = {ic[1]}")
