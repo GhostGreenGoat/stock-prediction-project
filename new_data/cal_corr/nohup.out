@@ -1,0 +1,4 @@
+Traceback (most recent call last):
+  File "/home/laiminzhi/new_data/corr_matrics/cal_corr.py", line 61, in <module>
+    draw_bar(pearson_corr.loc['y1_label'][2:],'./xy_data_3355_y1_label_pearson.pdf')
+TypeError: draw_bar() takes 1 positional argument but 2 were given
